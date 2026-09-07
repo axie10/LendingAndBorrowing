@@ -160,4 +160,297 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
 
         emit Deposit(msg.sender, token, amount);
     }
+
+    /**
+     * @dev Withdraw deposited tokens
+     * @param token The token to withdraw
+     * @param amount The amount to withdraw
+     */
+    function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused onlyActiveMarket(token) {
+        require(amount > 0, "Amount must be greater than 0");
+        require(userDeposits[msg.sender][token] >= amount, "Insufficient deposit");
+        require(canWithdraw(msg.sender, token, amount), "Withdrawal would make position unsafe");
+
+        userDeposits[msg.sender][token] -= amount;
+        users[msg.sender].totalDeposited -= amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+
+        if (users[msg.sender].totalDeposited == 0) {
+            users[msg.sender].isActive = false;
+        }
+
+        markets[token].totalSupply -= amount;
+
+        IERC20(token).safeTransfer(msg.sender, amount);
+
+        emit Withdraw(msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Borrow tokens against deposited collateral
+     * @param token The token to borrow
+     * @param amount The amount to borrow
+     */
+    function borrow(address token, uint256 amount) external nonReentrant whenNotPaused onlyActiveMarket(token) {
+        require(amount > 0, "Amount must be greater than 0");
+        require(markets[token].totalSupply >= amount, "Insufficient liquidity");
+        require(canBorrow(msg.sender, token, amount), "Borrow would exceed collateral limit");
+
+        userBorrows[msg.sender][token] += amount;
+        users[msg.sender].totalBorrowed += amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+        users[msg.sender].isActive = true;
+
+        markets[token].totalBorrow += amount;
+
+        IERC20(token).safeTransfer(msg.sender, amount);
+
+        emit Borrow(msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Repay borrowed tokens
+     * @param token The token to repay
+     * @param amount The amount to repay
+     */
+    function repay(address token, uint256 amount) external nonReentrant whenNotPaused onlyActiveMarket(token) {
+        require(amount > 0, "Amount must be greater than 0");
+        require(userBorrows[msg.sender][token] >= amount, "Insufficient borrow");
+
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        userBorrows[msg.sender][token] -= amount;
+        users[msg.sender].totalBorrowed -= amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+
+        if (users[msg.sender].totalBorrowed == 0) {
+            users[msg.sender].isActive = false;
+        }
+
+        markets[token].totalBorrow -= amount;
+
+        emit Repay(msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Check if a user can withdraw without making position unsafe
+     * @param user The user address
+     * @param token The token to withdraw
+     * @param amount The amount to withdraw
+     * @return True if withdrawal is safe
+     */
+    function canWithdraw(address user, address token, uint256 amount) public view returns (bool) {
+        uint256 currentRatio = getCollateralizationRatio(user);
+        if (currentRatio == type(uint256).max) return true;
+
+        // Calculate new ratio after withdrawal
+        uint256 newCollateralValue = 0;
+        uint256 totalBorrowValue = 0;
+
+        for (uint256 i = 0; i < supportedTokens.length; i++) {
+            address supportedToken = supportedTokens[i];
+            if (markets[supportedToken].isActive) {
+                uint256 depositAmount = userDeposits[user][supportedToken];
+                uint256 borrowAmount = userBorrows[user][supportedToken];
+
+                if (supportedToken == token) {
+                    depositAmount = depositAmount > amount ? depositAmount - amount : 0;
+                }
+
+                if (depositAmount > 0) {
+                    newCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                }
+
+                if (borrowAmount > 0) {
+                    totalBorrowValue += borrowAmount;
+                }
+            }
+        }
+
+        if (totalBorrowValue == 0) return true;
+        uint256 newRatio = (newCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        return newRatio >= LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @dev Get user's current collateralization ratio
+     * @param user The user address
+     * @return ratio The collateralization ratio in basis points
+     */
+    function getCollateralizationRatio(address user) public view returns (uint256 ratio) {
+        uint256 totalCollateralValue = 0;
+        uint256 totalBorrowValue = 0;
+
+        for (uint256 i = 0; i < supportedTokens.length; i++) {
+            address token = supportedTokens[i];
+            if (markets[token].isActive) {
+                uint256 depositAmount = userDeposits[user][token];
+                uint256 borrowAmount = userBorrows[user][token];
+
+                if (depositAmount > 0) {
+                    totalCollateralValue += (depositAmount * markets[token].collateralFactor) / BASIS_POINTS;
+                }
+
+                if (borrowAmount > 0) {
+                    totalBorrowValue += borrowAmount;
+                }
+            }
+        }
+
+        if (totalBorrowValue == 0) return type(uint256).max;
+        return (totalCollateralValue * BASIS_POINTS) / totalBorrowValue;
+    }
+
+    /**
+     * @dev Check if a user can borrow additional tokens
+     * @param user The user address
+     * @param token The token to borrow
+     * @param amount The amount to borrow
+     * @return True if borrow is allowed
+     */
+    function canBorrow(address user, address token, uint256 amount) public view returns (bool) {
+        uint256 currentRatio = getCollateralizationRatio(user);
+        if (currentRatio == type(uint256).max) return true;
+
+        // Calculate new ratio after borrow
+        uint256 totalCollateralValue = 0;
+        uint256 totalBorrowValue = 0;
+
+        for (uint256 i = 0; i < supportedTokens.length; i++) {
+            address supportedToken = supportedTokens[i];
+            if (markets[supportedToken].isActive) {
+                uint256 depositAmount = userDeposits[user][supportedToken];
+                uint256 borrowAmount = userBorrows[user][supportedToken];
+
+                if (supportedToken == token) {
+                    borrowAmount += amount;
+                }
+
+                if (depositAmount > 0) {
+                    totalCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                }
+
+                if (borrowAmount > 0) {
+                    totalBorrowValue += borrowAmount;
+                }
+            }
+        }
+
+        if (totalBorrowValue == 0) return true;
+        uint256 newRatio = (totalCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        return newRatio >= LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @dev Check if a user's position is liquidatable
+     * @param user The user address
+     * @return True if position can be liquidated
+     */
+    function isLiquidatable(address user) public view returns (bool) {
+        uint256 ratio = getCollateralizationRatio(user);
+        return ratio < LIQUIDATION_THRESHOLD;
+    }
+
+    /**
+     * @dev Find the best collateral token for liquidation
+     * @param user The user address
+     * @return The address of the best collateral token
+     */
+    function findBestCollateral(address user) internal view returns (address) {
+        address bestToken = address(0);
+        uint256 bestValue = 0;
+
+        for (uint256 i = 0; i < supportedTokens.length; i++) {
+            address token = supportedTokens[i];
+            if (markets[token].isActive && userDeposits[user][token] > 0) {
+                uint256 value = (userDeposits[user][token] * markets[token].collateralFactor) / BASIS_POINTS;
+                if (value > bestValue) {
+                    bestValue = value;
+                    bestToken = token;
+                }
+            }
+        }
+
+        return bestToken;
+    }
+
+    /**
+     * @dev Get user's nonce for signature verification
+     * @param user The user address
+     * @return The current nonce
+     */
+    function getNonce(address user) external view returns (uint256) {
+        return userNonces[user];
+    }
+
+    /**
+     * @dev Get market information
+     * @param token The token address
+     * @return Market information
+     */
+    function getMarket(address token) external view returns (Market memory) {
+        return markets[token];
+    }
+
+    /**
+     * @dev Get user information
+     * @param user The user address
+     * @return User information
+     */
+    function getUser(address user) external view returns (User memory) {
+        return users[user];
+    }
+
+    /**
+     * @dev Get user's deposit for a specific token
+     * @param user The user address
+     * @param token The token address
+     * @return The deposit amount
+     */
+    function getUserDeposit(address user, address token) external view returns (uint256) {
+        return userDeposits[user][token];
+    }
+
+    /**
+     * @dev Get user's borrow for a specific token
+     * @param user The user address
+     * @param token The token address
+     * @return The borrow amount
+     */
+    function getUserBorrow(address user, address token) external view returns (uint256) {
+        return userBorrows[user][token];
+    }
+
+    /**
+     * @dev Get all supported tokens
+     * @return Array of supported token addresses
+     */
+    function getSupportedTokens() external view returns (address[] memory) {
+        return supportedTokens;
+    }
+
+    /**
+     * @dev Pause the protocol (emergency function)
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the protocol
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Emergency function to recover stuck tokens
+     * @param token The token to recover
+     * @param to The address to send tokens to
+     * @param amount The amount to recover
+     */
+    function emergencyRecover(address token, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Invalid recipient");
+        IERC20(token).safeTransfer(to, amount);
+    }
 }
