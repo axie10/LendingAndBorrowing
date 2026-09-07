@@ -10,7 +10,6 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
-
 /**
  * @title LendingProtocol
  * @author Axie
@@ -27,39 +26,40 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
 
     // Structs
     struct User {
-        uint256 totalDeposited;      // Total amount deposited by user
-        uint256 totalBorrowed;       // Total amount borrowed by user
-        uint256 lastUpdateTime;      // Last time user's data was updated
-        bool isActive;               // Whether user has active positions
+        uint256 totalDeposited; // Total amount deposited by user
+        uint256 totalBorrowed; // Total amount borrowed by user
+        uint256 lastUpdateTime; // Last time user's data was updated
+        bool isActive; // Whether user has active positions
     }
 
     struct Market {
-        IERC20 token;                // The token being lent/borrowed
-        uint256 totalSupply;         // Total amount supplied to this market
-        uint256 totalBorrow;         // Total amount borrowed from this market
-        uint256 supplyRate;          // Current supply rate (APY in basis points)
-        uint256 borrowRate;          // Current borrow rate (APY in basis points)
-        uint256 collateralFactor;    // Collateral factor (0-10000, where 10000 = 100%)
-        bool isActive;               // Whether this market is active
+        IERC20 token; // The token being lent/borrowed
+        uint256 totalSupply; // Total amount supplied to this market
+        uint256 totalBorrow; // Total amount borrowed from this market
+        uint256 supplyRate; // Current supply rate (APY in basis points)
+        uint256 borrowRate; // Current borrow rate (APY in basis points)
+        uint256 collateralFactor; // Collateral factor (0-10000, where 10000 = 100%)
+        bool isActive; // Whether this market is active
     }
 
     struct SignatureData {
-        uint256 nonce;               // Unique nonce for signature
-        uint256 deadline;            // Signature expiration time
-        bytes signature;             // ECDSA signature
+        uint256 nonce; // Unique nonce for signature
+        uint256 deadline; // Signature expiration time
+        bytes signature; // ECDSA signature
     }
 
     // State variables
     mapping(address => User) public users;
     mapping(address => mapping(address => uint256)) public userDeposits; // user => token => amount
-    mapping(address => mapping(address => uint256)) public userBorrows;  // user => token => amount
+    mapping(address => mapping(address => uint256)) public userBorrows; // user => token => amount
     mapping(address => Market) public markets;
     mapping(address => uint256) public userNonces;
-    
+
     address[] public supportedTokens;
     uint256 public constant LIQUIDATION_THRESHOLD = 8000; // 80% in basis points
-    uint256 public constant LIQUIDATION_PENALTY = 500;    // 5% in basis points
-    uint256 public constant BASIS_POINTS = 10000; // this is variable to calculate precent
+    uint256 public constant LIQUIDATION_PENALTY = 500; // 5% in basis points
+    /// @notice Denominator for basis-point math. 10000 = 100.00% (4 decimal precision)
+    uint256 public constant BASIS_POINTS = 10000;
 
     // Events
     event MarketAdded(address indexed token, uint256 collateralFactor);
@@ -87,7 +87,7 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
     /**
      * @dev Constructor to initialize the protocol
      */
-    constructor () Ownable(msg.sender){}
+    constructor() Ownable(msg.sender) {}
 
     /**
      * @dev Add a new market to the protocol
@@ -96,15 +96,14 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
      * @param initialSupplyRate Initial supply rate in basis points
      * @param initialBorrowRate Initial borrow rate in basis points
      */
-    function addMarket(
-        address token,
-        uint256 collateralFactor,
-        uint256 initialSupplyRate,
-        uint256 initialBorrowRate
-    ) external onlyOwner {
+    function addMarket(address token, uint256 collateralFactor, uint256 initialSupplyRate, uint256 initialBorrowRate)
+        external
+        onlyOwner
+    {
         require(token != address(0), "Invalid token address");
         require(collateralFactor <= BASIS_POINTS, "Invalid collateral factor");
         require(!markets[token].isActive, "Market already exists");
+        require(initialBorrowRate >= initialSupplyRate, "Insolvent by design");
 
         markets[token] = Market({
             token: IERC20(token),
@@ -118,5 +117,47 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
 
         supportedTokens.push(token);
         emit MarketAdded(token, collateralFactor);
+    }
+
+    /**
+     * @dev Update market parameters
+     * @param token The token address
+     * @param collateralFactor New collateral factor
+     * @param supplyRate New supply rate
+     * @param borrowRate New borrow rate
+     */
+    function updateMarket(address token, uint256 collateralFactor, uint256 supplyRate, uint256 borrowRate)
+        external
+        onlyOwner
+        onlyActiveMarket(token)
+    {
+        require(collateralFactor <= BASIS_POINTS, "Invalid collateral factor");
+
+        markets[token].collateralFactor = collateralFactor;
+        markets[token].supplyRate = supplyRate;
+        markets[token].borrowRate = borrowRate;
+
+        emit MarketUpdated(token, collateralFactor);
+        emit RatesUpdated(token, supplyRate, borrowRate);
+    }
+
+    /**
+     * @dev Deposit tokens to earn interest
+     * @param token The token to deposit
+     * @param amount The amount to deposit
+     */
+    function deposit(address token, uint256 amount) external nonReentrant whenNotPaused onlyActiveMarket(token) {
+        require(amount > 0, "Amount must be greater than 0");
+
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        userDeposits[msg.sender][token] += amount;
+        users[msg.sender].totalDeposited += amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+        users[msg.sender].isActive = true;
+
+        markets[token].totalSupply += amount;
+
+        emit Deposit(msg.sender, token, amount);
     }
 }
