@@ -49,6 +49,18 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
         bytes signature;             // ECDSA signature
     }
 
+    // State variables
+    mapping(address => User) public users;
+    mapping(address => mapping(address => uint256)) public userDeposits; // user => token => amount
+    mapping(address => mapping(address => uint256)) public userBorrows;  // user => token => amount
+    mapping(address => Market) public markets;
+    mapping(address => uint256) public userNonces;
+    
+    address[] public supportedTokens;
+    uint256 public constant LIQUIDATION_THRESHOLD = 8000; // 80% in basis points
+    uint256 public constant LIQUIDATION_PENALTY = 500;    // 5% in basis points
+    uint256 public constant BASIS_POINTS = 10000; // this is variable to calculate precent
+
     // Events
     event MarketAdded(address indexed token, uint256 collateralFactor);
     event MarketUpdated(address indexed token, uint256 collateralFactor);
@@ -59,12 +71,52 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
     event Liquidate(address indexed liquidator, address indexed user, address indexed token, uint256 amount);
     event RatesUpdated(address indexed token, uint256 supplyRate, uint256 borrowRate);
 
-    // State variables
-    mapping(address => User) public users;
-    mapping(address => mapping(address => uint256)) public userDeposits; // user => token => amount
-    mapping(address => mapping(address => uint256)) public userBorrows;  // user => token => amount
-    mapping(address => Market) public markets;
-    mapping(address => uint256) public userNonces;
+    // Modifiers
+    modifier onlyActiveMarket(address token) {
+        require(markets[token].isActive, "Market not active");
+        _;
+    }
 
+    modifier onlyValidSignature(SignatureData calldata sigData) {
+        require(block.timestamp <= sigData.deadline, "Signature expired");
+        require(userNonces[msg.sender] == sigData.nonce, "Invalid nonce");
+        _;
+        userNonces[msg.sender]++;
+    }
+
+    /**
+     * @dev Constructor to initialize the protocol
+     */
     constructor () Ownable(msg.sender){}
+
+    /**
+     * @dev Add a new market to the protocol
+     * @param token The ERC20 token to add
+     * @param collateralFactor The collateral factor for this token (0-10000)
+     * @param initialSupplyRate Initial supply rate in basis points
+     * @param initialBorrowRate Initial borrow rate in basis points
+     */
+    function addMarket(
+        address token,
+        uint256 collateralFactor,
+        uint256 initialSupplyRate,
+        uint256 initialBorrowRate
+    ) external onlyOwner {
+        require(token != address(0), "Invalid token address");
+        require(collateralFactor <= BASIS_POINTS, "Invalid collateral factor");
+        require(!markets[token].isActive, "Market already exists");
+
+        markets[token] = Market({
+            token: IERC20(token),
+            totalSupply: 0,
+            totalBorrow: 0,
+            supplyRate: initialSupplyRate,
+            borrowRate: initialBorrowRate,
+            collateralFactor: collateralFactor,
+            isActive: true
+        });
+
+        supportedTokens.push(token);
+        emit MarketAdded(token, collateralFactor);
+    }
 }
