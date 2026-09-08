@@ -233,6 +233,82 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
+     * @dev Gasless deposit using off-chain signature
+     * @param token The token to deposit
+     * @param amount The amount to deposit
+     * @param sigData Signature data for verification
+     */
+    function depositWithSignature(address token, uint256 amount, SignatureData calldata sigData)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyActiveMarket(token)
+        onlyValidSignature(sigData)
+    {
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Verify signature
+        bytes32 messageHash = keccak256(abi.encodePacked("deposit", token, amount, sigData.nonce, sigData.deadline));
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address signer = ethSignedMessageHash.recover(sigData.signature);
+        require(signer == msg.sender, "Invalid signature");
+        require(signer != address(0), "Invalid signature2");
+
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        userDeposits[msg.sender][token] += amount;
+        users[msg.sender].totalDeposited += amount;
+        users[msg.sender].lastUpdateTime = block.timestamp;
+        users[msg.sender].isActive = true;
+
+        markets[token].totalSupply += amount;
+
+        emit Deposit(msg.sender, token, amount);
+    }
+
+    /**
+     * @dev Liquidate an undercollateralized position
+     * @param user The user to liquidate
+     * @param token The token to liquidate
+     * @param amount The amount to liquidate
+     */
+    function liquidate(address user, address token, uint256 amount)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyActiveMarket(token)
+    {
+        require(amount > 0, "Amount must be greater than 0");
+        require(userBorrows[user][token] >= amount, "Insufficient borrow to liquidate");
+        require(isLiquidatable(user), "Position is not liquidatable");
+
+        uint256 collateralToSeize = (amount * (BASIS_POINTS + LIQUIDATION_PENALTY)) / BASIS_POINTS;
+
+        // Find collateral token to seize
+        address collateralToken = findBestCollateral(user);
+        require(collateralToken != address(0), "No collateral to seize");
+        require(userDeposits[user][collateralToken] >= collateralToSeize, "Insufficient collateral");
+
+        // Transfer borrowed tokens from liquidator
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Update user's borrow
+        userBorrows[user][token] -= amount;
+        users[user].totalBorrowed -= amount;
+        markets[token].totalBorrow -= amount;
+
+        // Seize collateral
+        userDeposits[user][collateralToken] -= collateralToSeize;
+        users[user].totalDeposited -= collateralToSeize;
+        markets[collateralToken].totalSupply -= collateralToSeize;
+
+        // Transfer collateral to liquidator
+        IERC20(collateralToken).safeTransfer(msg.sender, collateralToSeize);
+
+        emit Liquidate(msg.sender, user, token, amount);
+    }
+
+    /**
      * @dev Check if a user can withdraw without making position unsafe
      * @param user The user address
      * @param token The token to withdraw
@@ -313,7 +389,7 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
         if (currentRatio == type(uint256).max) return true;
 
         // Calculate new ratio after borrow
-        uint256 totalCollateralValue = 0;
+        uint256 newCollateralValue = 0;
         uint256 totalBorrowValue = 0;
 
         for (uint256 i = 0; i < supportedTokens.length; i++) {
@@ -327,7 +403,7 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
                 }
 
                 if (depositAmount > 0) {
-                    totalCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
+                    newCollateralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINTS;
                 }
 
                 if (borrowAmount > 0) {
@@ -337,7 +413,8 @@ contract LendingProtocol is Ownable, ReentrancyGuard, Pausable {
         }
 
         if (totalBorrowValue == 0) return true;
-        uint256 newRatio = (totalCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        uint256 newRatio = (newCollateralValue * BASIS_POINTS) / totalBorrowValue;
+        // Return false because position is liquidity
         return newRatio >= LIQUIDATION_THRESHOLD;
     }
 
